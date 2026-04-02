@@ -1,752 +1,913 @@
 """
-app.py  —  Air AI Controller
-─────────────────────────────
-Entry point. Orchestrates camera capture, hand tracking, gesture
-recognition, mode switching, and UI rendering.
+app.py
+------
+Air AI Controller — Main application entry point.
 
-Technology choices (summary):
-  cv2 (OpenCV) — camera capture, all drawing, window management
-  mediapipe    — real-time 21-landmark hand detection on CPU
-  pyautogui    — cross-platform mouse move / click / scroll
-  numpy        — fast coordinate interpolation and array maths
-  utils.py     — smoothing (EMA), distance, glitter, FPS
-  hand_tracker.py — MediaPipe wrapper + gesture helpers
+Modes
+-----
+  M → Mouse Mode   : Index finger = cursor | Thumb+Index pinch = left click
+  D → Draw Mode    : Index draws | Index+Middle = pen up | C = clear canvas
+  V → Volume Mode  : Thumb-Index distance controls system volume
 
-Modes:
-  MOUSE   — index finger moves cursor; pinch (thumb+index) = click
-  DRAW    — index-only draws on a persistent canvas layer
-            press 'd' to toggle, or pinch two specific fingers
-
-Controls (keyboard):
-  d        — toggle DRAW / MOUSE
-  c        — clear drawing canvas
-  q / ESC  — quit
+Controls
+--------
+  M / D / V  : switch mode
+  C          : clear canvas (Draw mode only)
+  Q          : quit
 """
-
-import sys
-import time
 
 import cv2
 import numpy as np
 import pyautogui
+import time
+import sys
 
 from hand_tracker import HandTracker
-from utils import (
-    SmoothFilter, ClickDebounce, FPSCounter, GlitterEffect,
-    euclidean_distance, midpoint, map_to_screen,
-    distance_to_volume, draw_rounded_rect, overlay_alpha,
-)
+from utils        import (SmoothCursor, GlitterEffect, ClickDebounce,
+                          interpolate, put_text_shadow, draw_rounded_rect,
+                          draw_gradient_rect)
 
-# ─── Safety: pyautogui will raise exception on mouse fail rather than crash ──
+# ── Pycaw (Windows volume control) ─────────────────────────────────────────
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from comtypes import CLSCTX_ALL
+    from ctypes   import cast, POINTER
+    _PYCAW_OK = True
+except ImportError:
+    _PYCAW_OK = False
+
+# ── PyAutoGUI safety ────────────────────────────────────────────────────────
 pyautogui.FAILSAFE = False
-pyautogui.PAUSE    = 0           # remove built-in 0.1s delay for low latency
+pyautogui.PAUSE    = 0.0
 
-# ─── Screen dimensions ───────────────────────────────────────────────────────
-SCREEN_W, SCREEN_H = pyautogui.size()
 
-# ─── Camera / window settings ────────────────────────────────────────────────
-CAM_W,  CAM_H  = 1280, 720      # request this resolution from camera
-WIN_W,  WIN_H  = 1280, 720      # display window size (mirrors cam)
-MARGIN         = 120            # deadzone margin for coordinate mapping
+# ===========================================================================
+#  Constants & Theme
+# ===========================================================================
 
-# ─── Gesture thresholds (pixels) ─────────────────────────────────────────────
-CLICK_DIST        = 38          # thumb-index distance to trigger click
-VOLUME_MIN_DIST   = 30
-VOLUME_MAX_DIST   = 220
+# Window
+WIN_NAME  = "Air AI Controller"
+CAM_W, CAM_H = 1280, 720          # Capture resolution
+UI_W,  UI_H  = 1280, 720          # Display resolution
 
-# ─── Drawing presets ─────────────────────────────────────────────────────────
-COLORS = {
-    "White"  : (255, 255, 255),
-    "Red"    : (50,  50,  240),
-    "Green"  : (50, 200,  50),
-    "Blue"   : (230, 100,  30),
-    "Yellow" : (30, 220, 220),
-    "Purple" : (200,  60, 180),
-    "Cyan"   : (220, 200,  30),
-    "Eraser" : (0,   0,   0),
+# Panels
+HEADER_H  = 70
+LEFT_W    = 220
+RIGHT_W   = 230
+BOTTOM_H  = 0                      # reserved / unused
+
+# Camera area inside panels
+CAM_X1 = LEFT_W
+CAM_X2 = UI_W - RIGHT_W
+CAM_Y1 = HEADER_H
+CAM_Y2 = UI_H
+
+# Mouse mode: active region inside camera frame (avoids panel overlap)
+MOUSE_PAD_X1, MOUSE_PAD_X2 = 80,  CAM_W - 80
+MOUSE_PAD_Y1, MOUSE_PAD_Y2 = 80,  CAM_H - 80
+
+# Screen size (for PyAutoGUI)
+SCR_W, SCR_H = pyautogui.size()
+
+# ── Colour palette ───────────────────────────────────────────────────────────
+C = {
+    "bg"          : (18,  18,  24),
+    "panel"       : (26,  26,  36),
+    "header_top"  : (45,  30,  90),
+    "header_bot"  : (20,  20,  50),
+    "accent"      : (130, 90, 255),   # purple
+    "accent2"     : (60, 200, 255),   # cyan
+    "green"       : (60, 220, 120),
+    "red"         : (60,  80, 230),
+    "yellow"      : (40, 210, 240),
+    "white"       : (230, 230, 240),
+    "subtext"     : (140, 130, 160),
+    "divider"     : (50,  45,  70),
+    "vol_bar_bg"  : (40,  35,  60),
+    "vol_bar_fg"  : (100, 180, 255),
 }
-COLOR_NAMES  = list(COLORS.keys())
-BRUSH_WIDTHS = [3, 6, 10, 16, 24]      # selectable stroke widths
 
-# ─── Modes ────────────────────────────────────────────────────────────────────
-MODE_MOUSE = "MOUSE"
-MODE_DRAW  = "DRAW"
+FONT      = cv2.FONT_HERSHEY_DUPLEX
+FONT_MONO = cv2.FONT_HERSHEY_PLAIN
 
+# ── Draw palette colors (BGR) ────────────────────────────────────────────────
+DRAW_COLORS = [
+    ("White",   (240, 240, 240)),
+    ("Cyan",    (255, 220,  60)),
+    ("Magenta", (230,  60, 200)),
+    ("Yellow",  ( 30, 220, 240)),
+    ("Green",   ( 60, 220, 100)),
+    ("Red",     ( 40,  60, 230)),
+    ("Blue",    (230,  80,  40)),
+    ("Orange",  ( 30, 140, 255)),
+]
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  UI renderer  (draws HUD panels onto a frame)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class UI:
-    """
-    All on-screen HUD drawing lives here to keep app.py readable.
-    Drawn directly onto the BGR frame using OpenCV primitives.
-    """
-
-    # Fonts
-    FONT       = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_BOLD  = cv2.FONT_HERSHEY_DUPLEX
-
-    # Palette
-    BG_DARK    = (18, 18, 28)
-    ACCENT     = (100, 220, 255)       # cyan-ish
-    ACCENT2    = (180, 100, 255)       # purple
-    TEXT_LIGHT = (230, 230, 240)
-    RED        = (60,  60, 240)
-    GREEN      = (60, 210,  80)
-    PANEL_BG   = (30, 30, 46)
-
-    # ── color swatches (top bar) ──────────────────────────────────────────────
-
-    @staticmethod
-    def draw_color_bar(frame: np.ndarray, selected_color: str,
-                       selected_width: int, glitter_level: int) -> dict:
-        """
-        Draw the top toolbar: color swatches + brush width + glitter selector.
-        Returns a dict mapping color name → (x1,y1,x2,y2) for hit-testing.
-        """
-        h, w = frame.shape[:2]
-        bar_h = 64
-
-        # Semi-transparent panel
-        panel = np.full((bar_h, w, 3), UI.PANEL_BG, dtype=np.uint8)
-        overlay_alpha(frame, panel, 0, 0, alpha=0.85)
-
-        # Border line
-        cv2.line(frame, (0, bar_h), (w, bar_h), UI.ACCENT, 1)
-
-        hit_zones = {}
-
-        # ── color swatches ────────────────────────────────────────────────────
-        sw = 36; gap = 6; ox = 14; oy = 14
-        for i, name in enumerate(COLOR_NAMES):
-            color_bgr = COLORS[name]
-            x1 = ox + i * (sw + gap)
-            y1 = oy
-            x2 = x1 + sw
-            y2 = y1 + sw
-
-            # Draw swatch
-            if name == "Eraser":
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 60, 80), -1)
-                cv2.putText(frame, "E", (x1 + 10, y2 - 9),
-                            UI.FONT, 0.5, UI.TEXT_LIGHT, 1)
-            else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color_bgr, -1)
-
-            # Highlight selected
-            border_col = UI.ACCENT if name == selected_color else (80, 80, 100)
-            thick = 3 if name == selected_color else 1
-            cv2.rectangle(frame, (x1 - 1, y1 - 1), (x2 + 1, y2 + 1),
-                          border_col, thick)
-
-            hit_zones[name] = (x1, y1, x2, y2)
-
-        # ── brush width selector ──────────────────────────────────────────────
-        bx = ox + len(COLOR_NAMES) * (sw + gap) + 20
-        cv2.putText(frame, "W:", (bx, 42), UI.FONT, 0.45, UI.ACCENT, 1)
-        bx += 28
-        for i, bw in enumerate(BRUSH_WIDTHS):
-            cx_ = bx + i * 36 + 14
-            cy_ = 32
-            col = UI.ACCENT if bw == selected_width else (80, 80, 100)
-            cv2.circle(frame, (cx_, cy_), bw // 2 + 3, col, -1)
-            hit_zones[f"W{bw}"] = (cx_ - 14, cy_ - 20, cx_ + 14, cy_ + 20)
-
-        # ── glitter selector ──────────────────────────────────────────────────
-        gx = bx + len(BRUSH_WIDTHS) * 36 + 16
-        cv2.putText(frame, "Glitter:", (gx, 26), UI.FONT, 0.42, UI.ACCENT2, 1)
-        for i, level in enumerate([0, 1, 2, 3]):
-            rx1 = gx + i * 30
-            ry1 = 32
-            rx2 = rx1 + 22
-            ry2 = ry1 + 16
-            col = UI.ACCENT2 if level == glitter_level else (60, 60, 80)
-            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), col, -1)
-            label = "✦" if level > 0 else "○"
-            cv2.putText(frame, str(level), (rx1 + 6, ry2 - 3),
-                        UI.FONT, 0.38, UI.TEXT_LIGHT, 1)
-            hit_zones[f"G{level}"] = (rx1, ry1, rx2, ry2)
-
-        return hit_zones
-
-    # ── mode badge ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def draw_mode_badge(frame: np.ndarray, mode: str) -> None:
-        h, w = frame.shape[:2]
-        label = f"  {mode} MODE  "
-        col   = UI.GREEN if mode == MODE_DRAW else UI.ACCENT
-        # Draw filled pill
-        (tw, th), _ = cv2.getTextSize(label, UI.FONT_BOLD, 0.65, 2)
-        x1, y1 = w - tw - 30, h - 44
-        x2, y2 = w - 10, h - 14
-        draw_rounded_rect(frame, (x1, y1), (x2, y2), col, thickness=-1, radius=10)
-        cv2.putText(frame, label, (x1 + 6, y2 - 8), UI.FONT_BOLD, 0.55,
-                    UI.BG_DARK, 2)
-
-    # ── FPS + gesture info ────────────────────────────────────────────────────
-
-    @staticmethod
-    def draw_info(frame: np.ndarray, fps: float, vol: int,
-                  hand_visible: bool, clicking: bool) -> None:
-        h, w = frame.shape[:2]
-        # Left side info panel
-        lines = [
-            f"FPS: {fps:.0f}",
-            f"Vol: {vol}%",
-            f"Hand: {'YES' if hand_visible else 'NO'}",
-            f"Click: {'●' if clicking else '○'}",
-        ]
-        oy = h - 110
-        for i, ln in enumerate(lines):
-            col = UI.ACCENT if i < 2 else (UI.GREEN if "YES" in ln or "●" in ln else UI.TEXT_LIGHT)
-            cv2.putText(frame, ln, (14, oy + i * 22), UI.FONT, 0.52, col, 1)
-
-    # ── volume bar ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def draw_volume_bar(frame: np.ndarray, vol: int) -> None:
-        h, w = frame.shape[:2]
-        bar_x, bar_y = 16, 80
-        bar_h_total  = h - 200
-        filled_h     = int(bar_h_total * vol / 100)
-
-        # Background
-        cv2.rectangle(frame, (bar_x, bar_y),
-                      (bar_x + 18, bar_y + bar_h_total), (40, 40, 60), -1)
-        # Fill
-        fy = bar_y + bar_h_total - filled_h
-        color = UI.ACCENT if vol < 80 else UI.RED
-        cv2.rectangle(frame, (bar_x, fy),
-                      (bar_x + 18, bar_y + bar_h_total), color, -1)
-        cv2.putText(frame, "VOL", (bar_x - 2, bar_y - 6),
-                    UI.FONT, 0.38, UI.ACCENT, 1)
-
-    # ── shortcut hints ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def draw_hints(frame: np.ndarray) -> None:
-        hints = ["d: toggle mode", "c: clear", "q: quit"]
-        h, w  = frame.shape[:2]
-        for i, hint in enumerate(hints):
-            cv2.putText(frame, hint, (w - 150, h - 80 + i * 20),
-                        UI.FONT, 0.38, (100, 100, 130), 1)
-
-    # ── finger gesture indicators ─────────────────────────────────────────────
-
-    @staticmethod
-    def draw_finger_dots(frame: np.ndarray, fingers: list) -> None:
-        names = ["T", "I", "M", "R", "P"]
-        ox    = 50
-        for i, (name, up) in enumerate(zip(names, fingers)):
-            col = UI.GREEN if up else (60, 60, 80)
-            cv2.circle(frame, (ox + i * 22, frame.shape[0] - 24), 8, col, -1)
-            cv2.putText(frame, name, (ox + i * 22 - 5, frame.shape[0] - 16),
-                        UI.FONT, 0.32, UI.BG_DARK, 1)
+BRUSH_SIZES = [3, 6, 10, 16, 24]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Welcome / splash screen
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+#  Volume Initialisation (Pycaw)
+# ===========================================================================
 
-def draw_splash(frame: np.ndarray, cam_index: int) -> np.ndarray:
-    """
-    Render the welcome screen overlay on a camera preview frame.
-    Shows title, instructions, and a "PRESS ENTER to Start" prompt.
-    """
-    h, w = frame.shape[:2]
+def init_volume():
+    if not _PYCAW_OK:
+        return None, (-65.25, 0.0)
+    try:
+        devices   = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume    = cast(interface, POINTER(IAudioEndpointVolume))
+        vol_range = volume.GetVolumeRange()          # (min_dB, max_dB, step)
+        return volume, (vol_range[0], vol_range[1])
+    except Exception:
+        return None, (-65.25, 0.0)
 
-    # Dim the camera preview
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 20), -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+# ===========================================================================
+#  UI Drawing helpers
+# ===========================================================================
+
+def draw_header(frame, mode):
+    draw_gradient_rect(frame, 0, 0, UI_W, HEADER_H,
+                       C["header_top"], C["header_bot"])
+    cv2.line(frame, (0, HEADER_H), (UI_W, HEADER_H), C["accent"], 2)
 
     # Title
-    title      = "AIR AI CONTROLLER"
-    sub        = "Gesture-Driven Mouse, Volume & Air Drawing"
-    start_hint = "  PRESS  ENTER  TO  START  "
-    quit_hint  = "Press Q to quit"
+    put_text_shadow(frame, "AIR AI CONTROLLER",
+                    (LEFT_W + 20, 44), FONT, 0.90, C["white"], 2)
 
-    # Animated pulse border
-    pulse = int(abs(math.sin(time.time() * 2) * 80) + 40)
-    cv2.rectangle(frame, (40, 40), (w - 40, h - 40),
-                  (pulse, pulse // 2, 255 - pulse // 2), 2)
+    # Mode badge
+    mode_colors = {"MOUSE": C["green"], "DRAW": C["accent"], "VOLUME": C["yellow"]}
+    badge_color = mode_colors.get(mode, C["white"])
+    label = f"  {mode} MODE  "
+    (tw, th), _ = cv2.getTextSize(label, FONT, 0.65, 1)
+    bx = UI_W - RIGHT_W - tw - 30
+    draw_rounded_rect(frame, bx - 8, 16, bx + tw + 8, 54, 8, badge_color, -1)
+    cv2.putText(frame, label, (bx, 44), FONT, 0.65, C["bg"], 2, cv2.LINE_AA)
 
-    # Title text
-    (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_DUPLEX, 1.6, 3)
-    cv2.putText(frame, title, ((w - tw) // 2, h // 2 - 80),
-                cv2.FONT_HERSHEY_DUPLEX, 1.6, (100, 220, 255), 3)
 
-    (sw, _), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
-    cv2.putText(frame, sub, ((w - sw) // 2, h // 2 - 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 200), 1)
+def draw_left_panel(frame, mode):
+    # Panel background
+    cv2.rectangle(frame, (0, HEADER_H), (LEFT_W, UI_H), C["panel"], -1)
+    cv2.line(frame, (LEFT_W, HEADER_H), (LEFT_W, UI_H), C["divider"], 1)
 
-    # Feature list
-    features = [
-        "✦  Index finger  →  move mouse",
-        "✦  Pinch (thumb + index)  →  click",
-        "✦  Spread thumb + index  →  control volume",
-        "✦  [D]  →  toggle air drawing mode",
-        "✦  [C]  →  clear canvas",
+    y = HEADER_H + 28
+    put_text_shadow(frame, "CONTROLS", (14, y), FONT, 0.52, C["accent"], 1)
+    y += 8
+    cv2.line(frame, (10, y), (LEFT_W - 10, y), C["divider"], 1)
+    y += 22
+
+    INST = {
+        "MOUSE": [
+            (" Index Finger", "Move cursor"),
+            (" Pinch (Thumb+", "Index)  = Click"),
+            ("", ""),
+            (" M ", "Mouse Mode"),
+            (" D ", "Draw  Mode"),
+            (" V ", "Volume Mode"),
+            (" Q ", "Quit"),
+        ],
+        "DRAW": [
+            (" Index Finger", "Draw on screen"),
+            (" Index+Middle", "Pen up (stop)"),
+            (" C Key ", "Clear canvas"),
+            ("", ""),
+            (" M ", "Mouse Mode"),
+            (" D ", "Draw  Mode"),
+            (" V ", "Volume Mode"),
+            (" Q ", "Quit"),
+        ],
+        "VOLUME": [
+            (" Thumb+Index", "Distance ="),
+            ("", "Volume level"),
+            ("", ""),
+            (" Spread wide", "Max volume"),
+            (" Pinch close", "Min volume"),
+            ("", ""),
+            (" M ", "Mouse Mode"),
+            (" D ", "Draw  Mode"),
+            (" V ", "Volume Mode"),
+            (" Q ", "Quit"),
+        ],
+    }
+
+    for key, val in INST.get(mode, []):
+        if not key and not val:
+            y += 10
+            continue
+        if key in (" M ", " D ", " V ", " Q ", " C Key "):
+            # Key badge
+            draw_rounded_rect(frame, 12, y - 14, 12 + 40, y + 6, 4, C["accent"], -1)
+            cv2.putText(frame, key.strip(), (16, y), FONT_MONO, 1.1,
+                        C["bg"], 1, cv2.LINE_AA)
+            cv2.putText(frame, val, (60, y), FONT_MONO, 1.1,
+                        C["subtext"], 1, cv2.LINE_AA)
+        else:
+            put_text_shadow(frame, key, (14, y), FONT_MONO, 1.0, C["accent2"], 1)
+            if val:
+                put_text_shadow(frame, val, (14, y + 16), FONT_MONO, 1.0,
+                                C["subtext"], 1)
+                y += 16
+        y += 28
+
+
+def draw_right_panel_mouse(frame):
+    cv2.rectangle(frame, (UI_W - RIGHT_W, HEADER_H), (UI_W, UI_H), C["panel"], -1)
+    cv2.line(frame, (UI_W - RIGHT_W, HEADER_H),
+             (UI_W - RIGHT_W, UI_H), C["divider"], 1)
+    y = HEADER_H + 30
+    put_text_shadow(frame, "MOUSE MODE", (UI_W - RIGHT_W + 14, y),
+                    FONT, 0.48, C["green"], 1)
+    y += 30
+    tips = [
+        "Point index finger",
+        "to move the cursor.",
+        "",
+        "Pinch thumb and",
+        "index together",
+        "to left-click.",
+        "",
+        "Works with real",
+        "OS windows,",
+        "browsers, files.",
     ]
-    fy = h // 2 + 10
-    for feat in features:
-        (fw, _), _ = cv2.getTextSize(feat, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-        cv2.putText(frame, feat, ((w - fw) // 2, fy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 200, 160), 1)
-        fy += 26
-
-    # Start button
-    bp = int(abs(math.sin(time.time() * 3) * 30))
-    btn_col = (40 + bp, 100 + bp, 40 + bp)
-    (bw, _), _ = cv2.getTextSize(start_hint, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)
-    bx = (w - bw) // 2 - 14
-    by = fy + 20
-    draw_rounded_rect(frame, (bx, by - 26), (bx + bw + 28, by + 10),
-                      btn_col, thickness=-1, radius=10)
-    cv2.putText(frame, start_hint, (bx + 14, by),
-                cv2.FONT_HERSHEY_DUPLEX, 0.7, (200, 255, 200), 2)
-
-    (qw, _), _ = cv2.getTextSize(quit_hint, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-    cv2.putText(frame, quit_hint, ((w - qw) // 2, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100, 100, 120), 1)
-
-    return frame
+    for line in tips:
+        if line:
+            cv2.putText(frame, line, (UI_W - RIGHT_W + 12, y),
+                        FONT_MONO, 1.0, C["subtext"], 1, cv2.LINE_AA)
+        y += 20
 
 
-# Import math for splash (sin)
-import math
+def draw_right_panel_draw(frame, color_idx, brush_idx, glitter_on,
+                          palette_rects, brush_rects, glitter_rect):
+    cv2.rectangle(frame, (UI_W - RIGHT_W, HEADER_H), (UI_W, UI_H), C["panel"], -1)
+    cv2.line(frame, (UI_W - RIGHT_W, HEADER_H),
+             (UI_W - RIGHT_W, UI_H), C["divider"], 1)
+
+    px = UI_W - RIGHT_W + 14
+    y  = HEADER_H + 26
+    put_text_shadow(frame, "COLOR PALETTE", (px, y), FONT, 0.45, C["accent"], 1)
+    y += 16
+
+    # Color swatches (2 columns)
+    palette_rects.clear()
+    col_w = (RIGHT_W - 28) // 2
+    for i, (name, bgr) in enumerate(DRAW_COLORS):
+        col   = i % 2
+        row   = i // 2
+        sx    = px + col * (col_w + 4)
+        sy    = y  + row * 38
+        ex    = sx + col_w
+        ey    = sy + 30
+        draw_rounded_rect(frame, sx, sy, ex, ey, 6, bgr, -1)
+        palette_rects.append((sx, sy, ex, ey, i))
+        if i == color_idx:
+            draw_rounded_rect(frame, sx - 2, sy - 2, ex + 2, ey + 2,
+                              7, C["white"], 2)
+        cv2.putText(frame, name[:6], (sx + 4, sy + 20),
+                    FONT_MONO, 0.85, C["bg"], 1, cv2.LINE_AA)
+
+    y += (len(DRAW_COLORS) // 2) * 38 + 14
+    cv2.line(frame, (px - 4, y), (UI_W - 8, y), C["divider"], 1)
+    y += 18
+
+    # Brush sizes
+    put_text_shadow(frame, "BRUSH SIZE", (px, y), FONT, 0.45, C["accent"], 1)
+    y += 20
+    brush_rects.clear()
+    bx = px
+    for i, sz in enumerate(BRUSH_SIZES):
+        cx = bx + i * 40 + sz
+        cy = y + 16
+        cv2.circle(frame, (cx, cy), sz, C["white"], -1)
+        if i == brush_idx:
+            cv2.circle(frame, (cx, cy), sz + 3, C["accent"], 2)
+        brush_rects.append((cx - sz - 3, cy - sz - 3,
+                            cx + sz + 3, cy + sz + 3, i))
+        bx += 4
+    y += 50
+
+    cv2.line(frame, (px - 4, y), (UI_W - 8, y), C["divider"], 1)
+    y += 18
+
+    # Glitter toggle
+    put_text_shadow(frame, "GLITTER", (px, y), FONT, 0.45, C["accent"], 1)
+    y += 24
+    gx1, gy1, gx2, gy2 = px, y, px + 80, y + 28
+    glitter_rect[:] = [gx1, gy1, gx2, gy2]
+    tog_color = C["yellow"] if glitter_on else C["divider"]
+    draw_rounded_rect(frame, gx1, gy1, gx2, gy2, 8, tog_color, -1)
+    label = "ON " if glitter_on else "OFF"
+    cv2.putText(frame, label, (gx1 + 22, gy1 + 20),
+                FONT, 0.52, C["bg"] if glitter_on else C["subtext"],
+                1, cv2.LINE_AA)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Main application
-# ══════════════════════════════════════════════════════════════════════════════
+def draw_right_panel_volume(frame, vol_pct):
+    cv2.rectangle(frame, (UI_W - RIGHT_W, HEADER_H), (UI_W, UI_H), C["panel"], -1)
+    cv2.line(frame, (UI_W - RIGHT_W, HEADER_H),
+             (UI_W - RIGHT_W, UI_H), C["divider"], 1)
+
+    px = UI_W - RIGHT_W + 14
+    y  = HEADER_H + 30
+    put_text_shadow(frame, "VOLUME", (px, y), FONT, 0.52, C["yellow"], 1)
+    y += 50
+
+    # Vertical bar
+    bar_x  = UI_W - RIGHT_W + RIGHT_W // 2 - 20
+    bar_y1 = y
+    bar_y2 = y + 340
+    bar_w  = 40
+
+    # Background track
+    draw_rounded_rect(frame, bar_x, bar_y1, bar_x + bar_w, bar_y2,
+                      10, C["vol_bar_bg"], -1)
+
+    # Fill based on volume
+    fill_h  = int((bar_y2 - bar_y1) * vol_pct / 100)
+    fill_y1 = bar_y2 - fill_h
+    if fill_h > 4:
+        # Gradient fill: low=blue, high=green
+        for row in range(fill_y1, bar_y2):
+            t = (row - fill_y1) / max(fill_h, 1)
+            b = int(255 * (1 - t) * (vol_pct / 100))
+            g = int(180 * t)
+            r = 40
+            cv2.line(frame, (bar_x + 4, row), (bar_x + bar_w - 4, row),
+                     (r, g, b), 1)
+
+    # Border
+    draw_rounded_rect(frame, bar_x, bar_y1, bar_x + bar_w, bar_y2,
+                      10, C["accent"], 2)
+
+    # Percentage text
+    pct_label = f"{int(vol_pct)}%"
+    (tw, _), _ = cv2.getTextSize(pct_label, FONT, 0.80, 2)
+    cv2.putText(frame, pct_label,
+                (bar_x + bar_w // 2 - tw // 2, bar_y2 + 34),
+                FONT, 0.80, C["vol_bar_fg"], 2, cv2.LINE_AA)
+
+    # "MUTE" label at low volumes
+    if vol_pct < 3:
+        put_text_shadow(frame, "MUTED", (px, bar_y2 + 60),
+                        FONT, 0.55, C["red"], 1)
+
+
+def draw_status_bar(frame, fps, hand_ok, mode):
+    y = UI_H - 14
+    fps_color = C["green"] if fps >= 24 else C["yellow"] if fps >= 15 else C["red"]
+    cv2.putText(frame, f"FPS: {fps:.0f}", (LEFT_W + 10, y),
+                FONT_MONO, 1.1, fps_color, 1, cv2.LINE_AA)
+
+    hand_label = "Hand: DETECTED" if hand_ok else "Hand: NOT FOUND"
+    hand_color = C["green"] if hand_ok else C["red"]
+    cv2.putText(frame, hand_label, (LEFT_W + 100, y),
+                FONT_MONO, 1.1, hand_color, 1, cv2.LINE_AA)
+
+
+# ===========================================================================
+#  Main Application
+# ===========================================================================
 
 def main():
-    print("=" * 60)
-    print("   AIR AI CONTROLLER  —  starting up")
-    print("=" * 60)
-
-    # ── init camera ──────────────────────────────────────────────────────────
+    # ── Camera ──────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] Cannot open camera. Check device permissions.")
-        sys.exit(1)
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"   Camera: {actual_w}x{actual_h}")
-    print(f"   Screen: {SCREEN_W}x{SCREEN_H}")
+    if not cap.isOpened():
+        print("[ERROR] Cannot open webcam. Exiting.")
+        sys.exit(1)
 
-    # ── init modules ─────────────────────────────────────────────────────────
-    tracker  = HandTracker(detection_confidence=0.80, tracking_confidence=0.75)
-    smoother = SmoothFilter(alpha=0.25)
-    debounce = ClickDebounce(cooldown=0.35)
-    fps_ctr  = FPSCounter(window=30)
-    glitter  = GlitterEffect(max_particles=160)
+    # ── Modules ─────────────────────────────────────────────────────────────
+    tracker  = HandTracker(max_hands=1, detection_conf=0.75, tracking_conf=0.75)
+    smoother = SmoothCursor(alpha=0.22)
+    glitter  = GlitterEffect()
+    debounce = ClickDebounce(cooldown_frames=18)
 
-    # ── drawing canvas — persistent BGRA layer ────────────────────────────────
-    # We maintain a separate black canvas and blend it onto each camera frame.
-    # This lets us keep strokes between frames without redrawing every point.
-    canvas = np.zeros((actual_h, actual_w, 3), dtype=np.uint8)
+    # ── Volume ───────────────────────────────────────────────────────────────
+    vol_obj, (vol_min, vol_max) = init_volume()
+    vol_pct   = 50.0
+    vol_db    = 0.0
 
-    # ── state ─────────────────────────────────────────────────────────────────
-    mode           = MODE_MOUSE
-    draw_color     = "White"
-    brush_width    = 6
-    glitter_level  = 0              # 0=off, 1=light, 2=medium, 3=heavy
-    volume_pct     = 50
-    clicking       = False
-    prev_draw_pt   = None           # last drawing point for line interpolation
+    # ── State ────────────────────────────────────────────────────────────────
+    mode       = "MOUSE"    # MOUSE | DRAW | VOLUME
+    prev_x     = prev_y = 0
+    draw_x     = draw_y = 0
+    is_drawing = False
 
-    ui_hit_zones: dict = {}         # populated by UI.draw_color_bar each frame
+    # Draw canvas (transparent overlay, same size as camera region)
+    cam_region_w = CAM_X2 - CAM_X1
+    cam_region_h = CAM_Y2 - CAM_Y1
+    canvas = np.zeros((cam_region_h, cam_region_w, 3), dtype=np.uint8)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  SPLASH SCREEN LOOP
-    # ══════════════════════════════════════════════════════════════════════════
-    print("   Showing splash screen — press ENTER to continue…")
-    cv2.namedWindow("Air AI Controller", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Air AI Controller", WIN_W, WIN_H)
+    color_idx  = 0
+    brush_idx  = 1
+    glitter_on = False
 
+    # UI state for right panel interactables
+    palette_rects = []   # filled each frame
+    brush_rects   = []
+    glitter_rect  = [0, 0, 0, 0]
+
+    # FPS tracking
+    fps_list  = []
+    t_prev    = time.time()
+
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN_NAME, UI_W, UI_H)
+
+    print("[INFO] Air AI Controller started.")
+    print("[INFO] Press M=Mouse  D=Draw  V=Volume  C=Clear  Q=Quit")
+
+    # ── Main Loop ────────────────────────────────────────────────────────────
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("[ERROR] Failed to read frame.")
             break
-        frame = cv2.flip(frame, 1)          # mirror (selfie view)
-        splash_frame = draw_splash(frame.copy(), cam_index=0)
-        cv2.imshow("Air AI Controller", splash_frame)
 
+        frame = cv2.flip(frame, 1)                      # Mirror for natural feel
+        frame = cv2.resize(frame, (CAM_W, CAM_H))
+
+        # Hand tracking (draw landmarks on camera frame)
+        frame = tracker.find_hands(frame, draw=True)
+        fingers = tracker.fingers_up()
+        hand_ok = tracker.hand_detected()
+
+        # ── Camera feed crop to display region ──────────────────────────────
+        cam_crop = frame[0:CAM_H, 0:CAM_W]             # full camera frame
+        # Resize to fit the centre panel
+        cam_display = cv2.resize(
+            cam_crop,
+            (cam_region_w, cam_region_h),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+        # ────────────────────────────────────────────────────────────────────
+        #  Mode Logic
+        # ────────────────────────────────────────────────────────────────────
+
+        if mode == "MOUSE" and hand_ok:
+            # ── Mouse mode ─────────────────────────────────────────────────
+            ix, iy = tracker.get_landmark(8)   # Index fingertip
+
+            # Map camera coords → screen coords
+            sx = int(interpolate(ix, MOUSE_PAD_X1, MOUSE_PAD_X2, 0, SCR_W))
+            sy = int(interpolate(iy, MOUSE_PAD_Y1, MOUSE_PAD_Y2, 0, SCR_H))
+            sx, sy = smoother.update(sx, sy)
+
+            pyautogui.moveTo(sx, sy)
+
+            # Pinch detection: thumb(4) + index(8) distance
+            dist, mx, my = tracker.distance_between(4, 8)
+            if dist < 38 and debounce.ready():
+                pyautogui.click()
+                debounce.trigger()
+                # Visual pinch indicator on camera
+                # (mapped back to camera space)
+                cmx = int(interpolate(mx, 0, CAM_W, 0, cam_region_w))
+                cmy = int(interpolate(my, 0, CAM_H, 0, cam_region_h))
+                cv2.circle(cam_display, (cmx, cmy), 20, C["green"], 3)
+                cv2.putText(cam_display, "CLICK!", (cmx - 30, cmy - 28),
+                            FONT_MONO, 1.4, C["green"], 1, cv2.LINE_AA)
+
+        elif mode == "DRAW" and hand_ok:
+            # ── Draw mode ──────────────────────────────────────────────────
+            ix, iy = tracker.get_landmark(8)    # Index tip
+            mx, my = tracker.get_landmark(12)   # Middle tip
+
+            # Map to canvas space
+            cx = int(interpolate(ix, 0, CAM_W, 0, cam_region_w))
+            cy = int(interpolate(iy, 0, CAM_H, 0, cam_region_h))
+
+            # Index + Middle up → pen up
+            if fingers[1] == 1 and fingers[2] == 1:
+                is_drawing = False
+                draw_x = draw_y = 0
+                cv2.circle(cam_display, (cx, cy), 12, C["accent2"], 2)
+
+            # Only index up → drawing
+            elif fingers[1] == 1 and fingers[2] == 0:
+                brush_r = BRUSH_SIZES[brush_idx]
+                color   = DRAW_COLORS[color_idx][1]
+
+                if draw_x == 0 and draw_y == 0:
+                    draw_x, draw_y = cx, cy
+
+                cv2.line(canvas, (draw_x, draw_y), (cx, cy), color,
+                         brush_r, cv2.LINE_AA)
+
+                if glitter_on:
+                    glitter.spawn(cx, cy)
+
+                draw_x, draw_y = cx, cy
+                is_drawing = True
+
+                # Cursor ring
+                cv2.circle(cam_display, (cx, cy), brush_r + 4, color, 2)
+            else:
+                draw_x = draw_y = 0
+                is_drawing = False
+
+            # Render glitter onto canvas
+            if glitter_on:
+                glitter.render(canvas)
+
+            # Merge canvas onto camera display
+            mask = canvas.astype(bool).any(axis=2)
+            cam_display[mask] = cv2.addWeighted(
+                cam_display, 0.15, canvas, 0.85, 0
+            )[mask]
+
+        elif mode == "VOLUME" and hand_ok:
+            # ── Volume mode ────────────────────────────────────────────────
+            dist, mx, my = tracker.distance_between(4, 8)  # thumb–index
+
+            # Distance range ~20px (pinch) to ~220px (wide spread)
+            vol_pct = interpolate(dist, 20, 220, 0, 100)
+
+            if vol_obj is not None:
+                try:
+                    vol_db = interpolate(vol_pct, 0, 100, vol_min, vol_max)
+                    vol_obj.SetMasterVolumeLevel(vol_db, None)
+                except Exception:
+                    pass
+
+            # Visual line between thumb and index on camera display
+            t4 = tracker.get_landmark(4)
+            t8 = tracker.get_landmark(8)
+            if t4 and t8:
+                cmx4 = int(interpolate(t4[0], 0, CAM_W, 0, cam_region_w))
+                cmy4 = int(interpolate(t4[1], 0, CAM_H, 0, cam_region_h))
+                cmx8 = int(interpolate(t8[0], 0, CAM_W, 0, cam_region_w))
+                cmy8 = int(interpolate(t8[1], 0, CAM_H, 0, cam_region_h))
+                cv2.line(cam_display, (cmx4, cmy4), (cmx8, cmy8),
+                         C["yellow"], 2)
+                cv2.circle(cam_display, (cmx4, cmy4), 10, C["yellow"], -1)
+                cv2.circle(cam_display, (cmx8, cmy8), 10, C["yellow"], -1)
+                cv2.circle(cam_display,
+                           ((cmx4 + cmx8) // 2, (cmy4 + cmy8) // 2),
+                           6, C["white"], -1)
+
+        # Also merge canvas when just displaying (other modes shouldn't clear it)
+        if mode != "DRAW":
+            mask = canvas.astype(bool).any(axis=2)
+            cam_display[mask] = cv2.addWeighted(
+                cam_display, 0.15, canvas, 0.85, 0
+            )[mask]
+
+        # ────────────────────────────────────────────────────────────────────
+        #  Build UI frame
+        # ────────────────────────────────────────────────────────────────────
+        ui = np.full((UI_H, UI_W, 3), C["bg"], dtype=np.uint8)
+
+        # Paste camera into centre region
+        ui[CAM_Y1:CAM_Y2, CAM_X1:CAM_X2] = cam_display
+
+        # Header
+        draw_header(ui, mode)
+
+        # Left panel
+        draw_left_panel(ui, mode)
+
+        # Right panel
+        if mode == "MOUSE":
+            draw_right_panel_mouse(ui)
+        elif mode == "DRAW":
+            draw_right_panel_draw(ui, color_idx, brush_idx, glitter_on,
+                                  palette_rects, brush_rects, glitter_rect)
+        elif mode == "VOLUME":
+            draw_right_panel_volume(ui, vol_pct)
+
+        # FPS
+        t_now = time.time()
+        fps   = 1.0 / max(t_now - t_prev, 1e-6)
+        t_prev = t_now
+        fps_list.append(fps)
+        if len(fps_list) > 15:
+            fps_list.pop(0)
+        avg_fps = sum(fps_list) / len(fps_list)
+
+        draw_status_bar(ui, avg_fps, hand_ok, mode)
+
+        # ────────────────────────────────────────────────────────────────────
+        #  Show & Key Handling
+        # ────────────────────────────────────────────────────────────────────
+        cv2.imshow(WIN_NAME, ui)
         key = cv2.waitKey(1) & 0xFF
-        if key == 13 or key == 10:          # ENTER
+
+        if key == ord('q') or key == 27:
             break
-        if key == ord('q') or key == 27:    # Q or ESC
-            cap.release()
-            cv2.destroyAllWindows()
-            return
-
-    print("   Starting main loop — enjoy! 🖐")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  MAIN LOOP
-    # ══════════════════════════════════════════════════════════════════════════
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[WARN] Frame grab failed — camera disconnected?")
-            break
-
-        # ── pre-process ───────────────────────────────────────────────────────
-        frame = cv2.flip(frame, 1)          # mirror for intuitive control
-        h, w  = frame.shape[:2]
-
-        # ── hand detection (MediaPipe) ────────────────────────────────────────
-        tracker.process_frame(frame)
-        tracker.draw_landmarks(frame)       # draws skeleton on frame
-
-        fingers      = tracker.fingers_up()
-        hand_visible = tracker.hand_visible
-        clicking     = False
-
-        # Landmarks we care about most
-        thumb_tip  = tracker.get_landmark(4)
-        index_tip  = tracker.get_landmark(8)
-        middle_tip = tracker.get_landmark(12)
-
-        # ── gesture recognition ───────────────────────────────────────────────
-        if hand_visible and index_tip:
-
-            # --- 1. Volume control: thumb + index spread (any mode) -----------
-            if thumb_tip:
-                dist = euclidean_distance(thumb_tip, index_tip)
-                volume_pct = distance_to_volume(dist,
-                                                VOLUME_MIN_DIST,
-                                                VOLUME_MAX_DIST)
-                # Draw stretch line between thumb and index
-                cv2.line(frame, thumb_tip, index_tip, (180, 180, 200), 2)
-                mp_pt = midpoint(thumb_tip, index_tip)
-                cv2.circle(frame, mp_pt, 6, (100, 220, 255), -1)
-
-                # --- 2. Click: pinch gesture ----------------------------------
-                if dist < CLICK_DIST and mode == MODE_MOUSE:
-                    clicking = True
-                    if debounce.can_click():
-                        pyautogui.click()
-                        # Visual feedback circle
-                        cv2.circle(frame, index_tip, 20, (60, 60, 240), 3)
-
-            # --- 3. Mode toggle via gesture: middle+index up, rest down -------
-            #     (user can also press 'd' keyboard key)
-
-            # --- 4. MOUSE MODE: move cursor ----------------------------------
-            if mode == MODE_MOUSE:
-                # Only move when index finger is up (prevents drift during pinch)
-                if fingers[1] == 1:
-                    sx, sy = map_to_screen(index_tip[0], index_tip[1],
-                                           w, h,
-                                           SCREEN_W, SCREEN_H,
-                                           MARGIN)
-                    # Apply EMA smoothing to reduce jitter
-                    sx, sy = smoother.smooth(sx, sy)
-                    pyautogui.moveTo(int(sx), int(sy))
-
-                # Highlight cursor fingertip
-                cv2.circle(frame, index_tip, 12, (100, 220, 255), -1)
-                cv2.circle(frame, index_tip, 14, (255, 255, 255), 2)
-
-            # --- 5. DRAW MODE: paint on canvas when ONLY index is up ---------
-            elif mode == MODE_DRAW:
-                # Only draw when index up and middle down (pen-up = stop)
-                is_drawing = (fingers[1] == 1 and fingers[2] == 0)
-                tip_color  = COLORS.get(draw_color, (255, 255, 255))
-                thickness  = brush_width if draw_color != "Eraser" else 40
-
-                if is_drawing:
-                    if prev_draw_pt is not None:
-                        cv2.line(canvas, prev_draw_pt, index_tip,
-                                 tip_color, thickness,
-                                 lineType=cv2.LINE_AA)
-                    prev_draw_pt = index_tip
-
-                    # Glitter particles
-                    if glitter_level > 0:
-                        glitter.emit(index_tip[0], index_tip[1],
-                                     tip_color, intensity=glitter_level * 2)
-                else:
-                    prev_draw_pt = None     # lift pen
-
-                # Show fingertip indicator
-                dot_col = (50, 220, 50) if is_drawing else (80, 80, 120)
-                cv2.circle(frame, index_tip, 10, dot_col, -1)
-
-        else:
-            prev_draw_pt = None             # hand lost: lift pen
-
-        # ── blend canvas onto frame ───────────────────────────────────────────
-        # Only blend non-black pixels from canvas (mask = any channel > 0)
-        canvas_mask = np.any(canvas > 0, axis=2)
-        frame[canvas_mask] = cv2.addWeighted(
-            frame, 0.15, canvas, 0.85, 0
-        )[canvas_mask]
-
-        # ── glitter update ────────────────────────────────────────────────────
-        if glitter_level > 0:
-            glitter.update_and_draw(frame)
-
-        # ── draw UI elements ─────────────────────────────────────────────────
-        ui_hit_zones = UI.draw_color_bar(frame, draw_color,
-                                         brush_width, glitter_level)
-        UI.draw_mode_badge(frame, mode)
-        UI.draw_info(frame, fps_ctr.tick(), volume_pct,
-                     hand_visible, clicking)
-        UI.draw_volume_bar(frame, volume_pct)
-        UI.draw_hints(frame)
-        if hand_visible:
-            UI.draw_finger_dots(frame, fingers)
-
-        # Bounding box around hand
-        bb = tracker.bounding_box()
-        if bb:
-            bx, by, bw, bh = bb
-            cv2.rectangle(frame, (bx, 64), (bx + bw, by + bh),
-                          (60, 60, 100), 1)
-
-        # ── show frame ────────────────────────────────────────────────────────
-        cv2.imshow("Air AI Controller", frame)
-
-        # ── keyboard shortcuts ────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('d') or key == ord('D'):
-            mode = MODE_DRAW if mode == MODE_MOUSE else MODE_MOUSE
+        elif key == ord('m') or key == ord('M'):
+            mode = "MOUSE"
             smoother.reset()
-            prev_draw_pt = None
-            print(f"   Mode → {mode}")
-
+        elif key == ord('d') or key == ord('D'):
+            mode = "DRAW"
+        elif key == ord('v') or key == ord('V'):
+            mode = "VOLUME"
         elif key == ord('c') or key == ord('C'):
-            canvas[:] = 0
-            glitter.particles.clear()
-            print("   Canvas cleared.")
+            if mode == "DRAW":
+                canvas[:] = 0
+                glitter.clear()
 
-        elif key == ord('q') or key == 27:     # Q or ESC
-            print("   Quit requested.")
-            break
+        # ── Mouse clicks on right-panel UI (Draw mode) ──────────────────────
+        # We intercept mouse events on the OpenCV window for palette selection
+        # (done via a global state + setMouseCallback below)
 
-        # ── UI toolbar hit-testing (mouse click on toolbar) ──────────────────
-        # We use OpenCV mouse callback for toolbar interaction
-        # (set up below via cv2.setMouseCallback)
-
-    # ── cleanup ───────────────────────────────────────────────────────────────
     cap.release()
     cv2.destroyAllWindows()
-    print("   Air AI Controller shut down cleanly. ✓")
+    print("[INFO] Air AI Controller closed.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Mouse callback for toolbar clicks
-# ══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+#  Mouse callback for panel interactions (palette / brush / glitter)
+# ===========================================================================
 
-# We need shared state between callback and main loop:
-_toolbar_state = {
-    "color"   : "White",
-    "width"   : 6,
-    "glitter" : 0,
-    "zones"   : {},
+_click_state = {
+    "palette_rects": [],
+    "brush_rects"  : [],
+    "glitter_rect" : [0, 0, 0, 0],
+    "color_idx"    : [0],
+    "brush_idx"    : [1],
+    "glitter_on"   : [False],
+    "mode"         : ["MOUSE"],
 }
 
-def _mouse_callback(event, x, y, flags, param):
+
+def _mouse_cb(event, x, y, flags, param):
     if event != cv2.EVENT_LBUTTONDOWN:
         return
-    zones = _toolbar_state["zones"]
-    for key, (x1, y1, x2, y2) in zones.items():
+    if _click_state["mode"][0] != "DRAW":
+        return
+
+    for (x1, y1, x2, y2, i) in _click_state["palette_rects"]:
         if x1 <= x <= x2 and y1 <= y <= y2:
-            if key in COLOR_NAMES:
-                _toolbar_state["color"] = key
-            elif key.startswith("W"):
-                _toolbar_state["width"] = int(key[1:])
-            elif key.startswith("G"):
-                _toolbar_state["glitter"] = int(key[1:])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Re-entrant main with toolbar state
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main_v2():
-    """
-    Enhanced main that also supports clicking the toolbar with the mouse.
-    This replaces `main()` as the real entry point.
-    """
-    print("=" * 60)
-    print("   AIR AI CONTROLLER  —  starting up (v2)")
-    print("=" * 60)
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] Cannot open camera.")
-        sys.exit(1)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"   Camera resolution: {actual_w}x{actual_h}")
-    print(f"   Screen resolution: {SCREEN_W}x{SCREEN_H}")
-
-    tracker  = HandTracker()
-    smoother = SmoothFilter(alpha=0.25)
-    debounce = ClickDebounce(cooldown=0.35)
-    fps_ctr  = FPSCounter(window=30)
-    glitter  = GlitterEffect(max_particles=180)
-
-    canvas   = np.zeros((actual_h, actual_w, 3), dtype=np.uint8)
-
-    mode         = MODE_MOUSE
-    volume_pct   = 50
-    clicking     = False
-    prev_draw_pt = None
-
-    # ── window setup ─────────────────────────────────────────────────────────
-    cv2.namedWindow("Air AI Controller", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Air AI Controller", WIN_W, WIN_H)
-    cv2.setMouseCallback("Air AI Controller", _mouse_callback)
-
-    # ══ Splash loop ══════════════════════════════════════════════════════════
-    print("   Splash screen → press ENTER to begin")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.flip(frame, 1)
-        cv2.imshow("Air AI Controller", draw_splash(frame.copy(), 0))
-        key = cv2.waitKey(1) & 0xFF
-        if key in (13, 10):
-            break
-        if key == ord('q') or key == 27:
-            cap.release()
-            cv2.destroyAllWindows()
+            _click_state["color_idx"][0] = i
             return
 
-    print("   ▶  Main loop running — wave your hand!")
+    for (x1, y1, x2, y2, i) in _click_state["brush_rects"]:
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            _click_state["brush_idx"][0] = i
+            return
 
-    # ══ Main loop ════════════════════════════════════════════════════════════
+    gr = _click_state["glitter_rect"]
+    if gr[0] <= x <= gr[2] and gr[1] <= y <= gr[3]:
+        _click_state["glitter_on"][0] = not _click_state["glitter_on"][0]
+
+
+# ===========================================================================
+#  Main with mouse-callback wiring
+# ===========================================================================
+
+def main_with_ui():
+    """
+    Wrapper that wires up the OpenCV mouse callback for panel interactions
+    and runs the main loop with shared state.
+    """
+    # ── Camera ──────────────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    if not cap.isOpened():
+        print("[ERROR] Cannot open webcam. Exiting.")
+        sys.exit(1)
+
+    # ── Modules ─────────────────────────────────────────────────────────────
+    tracker  = HandTracker(max_hands=1, detection_conf=0.75, tracking_conf=0.75)
+    smoother = SmoothCursor(alpha=0.22)
+    glitter  = GlitterEffect()
+    debounce = ClickDebounce(cooldown_frames=18)
+
+    # ── Volume ───────────────────────────────────────────────────────────────
+    vol_obj, (vol_min, vol_max) = init_volume()
+    vol_pct = 50.0
+
+    # ── Mutable state (shared with mouse callback via dict) ──────────────────
+    state = {
+        "mode"        : "MOUSE",
+        "color_idx"   : 0,
+        "brush_idx"   : 1,
+        "glitter_on"  : False,
+        "palette_rects": [],
+        "brush_rects"  : [],
+        "glitter_rect" : [0, 0, 0, 0],
+    }
+
+    cam_region_w = CAM_X2 - CAM_X1
+    cam_region_h = CAM_Y2 - CAM_Y1
+    canvas = np.zeros((cam_region_h, cam_region_w, 3), dtype=np.uint8)
+
+    prev_draw_x = prev_draw_y = 0
+
+    fps_list = []
+    t_prev   = time.time()
+
+    # ── Window + callback ────────────────────────────────────────────────────
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN_NAME, UI_W, UI_H)
+
+    def mouse_cb(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if state["mode"] != "DRAW":
+            return
+        for (x1, y1, x2, y2, i) in state["palette_rects"]:
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                state["color_idx"] = i
+                return
+        for (x1, y1, x2, y2, i) in state["brush_rects"]:
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                state["brush_idx"] = i
+                return
+        gr = state["glitter_rect"]
+        if gr[0] <= x <= gr[2] and gr[1] <= y <= gr[3]:
+            state["glitter_on"] = not state["glitter_on"]
+
+    cv2.setMouseCallback(WIN_NAME, mouse_cb)
+
+    print("[INFO] Air AI Controller started.")
+    print("[INFO] Press M=Mouse  D=Draw  V=Volume  C=Clear  Q=Quit")
+    if not _PYCAW_OK:
+        print("[WARN] Pycaw not found – volume control disabled (simulated).")
+
+    smoother_x = smoother_y = 0.0
+
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("[ERROR] Frame read failed.")
             break
+
         frame = cv2.flip(frame, 1)
-        h, w  = frame.shape[:2]
+        frame = cv2.resize(frame, (CAM_W, CAM_H))
 
-        # Sync toolbar state
-        draw_color    = _toolbar_state["color"]
-        brush_width   = _toolbar_state["width"]
-        glitter_level = _toolbar_state["glitter"]
+        frame   = tracker.find_hands(frame, draw=True)
+        fingers = tracker.fingers_up()
+        hand_ok = tracker.hand_detected()
 
-        tracker.process_frame(frame)
-        tracker.draw_landmarks(frame)
+        cam_display = cv2.resize(
+            frame, (cam_region_w, cam_region_h),
+            interpolation=cv2.INTER_LINEAR
+        )
 
-        fingers      = tracker.fingers_up()
-        hand_visible = tracker.hand_visible
-        clicking     = False
+        mode = state["mode"]
 
-        thumb_tip  = tracker.get_landmark(4)
-        index_tip  = tracker.get_landmark(8)
+        # ── MOUSE MODE ────────────────────────────────────────────────────
+        if mode == "MOUSE" and hand_ok:
+            pos = tracker.get_landmark(8)
+            if pos:
+                ix, iy = pos
+                sx = int(interpolate(ix, MOUSE_PAD_X1, MOUSE_PAD_X2, 0, SCR_W))
+                sy = int(interpolate(iy, MOUSE_PAD_Y1, MOUSE_PAD_Y2, 0, SCR_H))
+                sx, sy = smoother.update(sx, sy)
+                pyautogui.moveTo(sx, sy)
 
-        if hand_visible and index_tip:
+                dist, mx, my = tracker.distance_between(4, 8)
+                if dist < 38 and debounce.ready():
+                    pyautogui.click()
+                    debounce.trigger()
+                    cmx = int(interpolate(mx, 0, CAM_W, 0, cam_region_w))
+                    cmy = int(interpolate(my, 0, CAM_H, 0, cam_region_h))
+                    cv2.circle(cam_display, (cmx, cmy), 22, C["green"], 3)
+                    put_text_shadow(cam_display, "CLICK",
+                                   (cmx - 28, cmy - 30),
+                                   FONT_MONO, 1.4, C["green"], 1)
 
-            # Volume / pinch distance
-            if thumb_tip:
-                dist = euclidean_distance(thumb_tip, index_tip)
-                volume_pct = distance_to_volume(dist, VOLUME_MIN_DIST, VOLUME_MAX_DIST)
+        # ── DRAW MODE ─────────────────────────────────────────────────────
+        elif mode == "DRAW" and hand_ok:
+            pos8  = tracker.get_landmark(8)
+            pos12 = tracker.get_landmark(12)
 
-                cv2.line(frame, thumb_tip, index_tip, (160, 160, 200), 2)
-                cv2.circle(frame, midpoint(thumb_tip, index_tip), 5, UI.ACCENT, -1)
+            if pos8:
+                ix, iy = pos8
+                cx = int(interpolate(ix, 0, CAM_W, 0, cam_region_w))
+                cy = int(interpolate(iy, 0, CAM_H, 0, cam_region_h))
 
-                if dist < CLICK_DIST and mode == MODE_MOUSE:
-                    clicking = True
-                    if debounce.can_click():
-                        pyautogui.click()
-                        cv2.circle(frame, index_tip, 22, UI.RED, 3)
+                # Pen up: index + middle both up
+                if fingers[1] == 1 and fingers[2] == 1:
+                    prev_draw_x = prev_draw_y = 0
+                    cv2.circle(cam_display, (cx, cy), 14, C["accent2"], 2)
 
-            if mode == MODE_MOUSE:
-                if fingers[1]:
-                    sx, sy = map_to_screen(index_tip[0], index_tip[1],
-                                           w, h, SCREEN_W, SCREEN_H, MARGIN)
-                    sx, sy = smoother.smooth(sx, sy)
-                    pyautogui.moveTo(int(sx), int(sy))
-                cv2.circle(frame, index_tip, 12, UI.ACCENT, -1)
-                cv2.circle(frame, index_tip, 14, (255, 255, 255), 2)
+                # Drawing: only index up
+                elif fingers[1] == 1 and fingers[2] == 0:
+                    brush_r = BRUSH_SIZES[state["brush_idx"]]
+                    color   = DRAW_COLORS[state["color_idx"]][1]
 
-            elif mode == MODE_DRAW:
-                tip_color = COLORS.get(draw_color, (255, 255, 255))
-                thick     = brush_width if draw_color != "Eraser" else 42
-                drawing   = fingers[1] == 1 and fingers[2] == 0
+                    if prev_draw_x == 0 and prev_draw_y == 0:
+                        prev_draw_x, prev_draw_y = cx, cy
 
-                if drawing:
-                    if prev_draw_pt:
-                        cv2.line(canvas, prev_draw_pt, index_tip,
-                                 tip_color, thick, cv2.LINE_AA)
-                    prev_draw_pt = index_tip
-                    if glitter_level > 0:
-                        glitter.emit(index_tip[0], index_tip[1],
-                                     tip_color, intensity=glitter_level * 2)
+                    cv2.line(canvas, (prev_draw_x, prev_draw_y),
+                             (cx, cy), color, brush_r, cv2.LINE_AA)
+
+                    if state["glitter_on"]:
+                        glitter.spawn(cx, cy)
+
+                    prev_draw_x, prev_draw_y = cx, cy
+                    cv2.circle(cam_display, (cx, cy), brush_r + 4, color, 2)
                 else:
-                    prev_draw_pt = None
+                    prev_draw_x = prev_draw_y = 0
 
-                cv2.circle(frame, index_tip, 10,
-                           (50, 220, 50) if drawing else (80, 80, 120), -1)
-        else:
-            prev_draw_pt = None
+            if state["glitter_on"]:
+                glitter.render(canvas)
 
-        # Blend drawing canvas
-        mask = np.any(canvas > 0, axis=2)
-        frame[mask] = cv2.addWeighted(frame, 0.12, canvas, 0.88, 0)[mask]
+            mask = canvas.astype(bool).any(axis=2)
+            cam_display[mask] = cv2.addWeighted(
+                cam_display, 0.15, canvas, 0.85, 0)[mask]
 
-        # Glitter
-        if glitter_level > 0:
-            glitter.update_and_draw(frame)
+        # ── VOLUME MODE ───────────────────────────────────────────────────
+        elif mode == "VOLUME" and hand_ok:
+            dist, _, _ = tracker.distance_between(4, 8)
+            vol_pct = interpolate(dist, 20, 220, 0, 100)
 
-        # UI
-        zones = UI.draw_color_bar(frame, draw_color, brush_width, glitter_level)
-        _toolbar_state["zones"] = zones
-        UI.draw_mode_badge(frame, mode)
-        UI.draw_info(frame, fps_ctr.tick(), volume_pct, hand_visible, clicking)
-        UI.draw_volume_bar(frame, volume_pct)
-        UI.draw_hints(frame)
-        if hand_visible:
-            UI.draw_finger_dots(frame, fingers)
+            if vol_obj is not None:
+                try:
+                    vdb = interpolate(vol_pct, 0, 100, vol_min, vol_max)
+                    vol_obj.SetMasterVolumeLevel(vdb, None)
+                except Exception:
+                    pass
 
-        bb = tracker.bounding_box()
-        if bb:
-            bx, by, bw2, bh = bb
-            cv2.rectangle(frame, (bx, 68), (bx + bw2, by + bh), (60, 60, 100), 1)
+            t4 = tracker.get_landmark(4)
+            t8 = tracker.get_landmark(8)
+            if t4 and t8:
+                p4 = (int(interpolate(t4[0], 0, CAM_W, 0, cam_region_w)),
+                      int(interpolate(t4[1], 0, CAM_H, 0, cam_region_h)))
+                p8 = (int(interpolate(t8[0], 0, CAM_W, 0, cam_region_w)),
+                      int(interpolate(t8[1], 0, CAM_H, 0, cam_region_h)))
+                cv2.line(cam_display, p4, p8, C["yellow"], 3)
+                cv2.circle(cam_display, p4, 12, C["yellow"], -1)
+                cv2.circle(cam_display, p8, 12, C["yellow"], -1)
+                mid = ((p4[0] + p8[0]) // 2, (p4[1] + p8[1]) // 2)
+                cv2.circle(cam_display, mid, 7, C["white"], -1)
+                put_text_shadow(cam_display, f"{int(vol_pct)}%",
+                               (mid[0] + 14, mid[1] - 8),
+                               FONT, 0.65, C["yellow"], 1)
 
-        cv2.imshow("Air AI Controller", frame)
+        # Overlay draw canvas in non-draw modes (preserve strokes)
+        if mode != "DRAW":
+            mask = canvas.astype(bool).any(axis=2)
+            if mask.any():
+                cam_display[mask] = cv2.addWeighted(
+                    cam_display, 0.15, canvas, 0.85, 0)[mask]
 
+        # ── Build UI ──────────────────────────────────────────────────────
+        ui = np.full((UI_H, UI_W, 3), C["bg"], dtype=np.uint8)
+        ui[CAM_Y1:CAM_Y2, CAM_X1:CAM_X2] = cam_display
+
+        draw_header(ui, mode)
+        draw_left_panel(ui, mode)
+
+        if mode == "MOUSE":
+            draw_right_panel_mouse(ui)
+        elif mode == "DRAW":
+            draw_right_panel_draw(
+                ui,
+                state["color_idx"],
+                state["brush_idx"],
+                state["glitter_on"],
+                state["palette_rects"],
+                state["brush_rects"],
+                state["glitter_rect"],
+            )
+        elif mode == "VOLUME":
+            draw_right_panel_volume(ui, vol_pct)
+
+        # FPS counter
+        t_now  = time.time()
+        fps    = 1.0 / max(t_now - t_prev, 1e-6)
+        t_prev = t_now
+        fps_list.append(fps)
+        if len(fps_list) > 15:
+            fps_list.pop(0)
+        avg_fps = sum(fps_list) / len(fps_list)
+
+        draw_status_bar(ui, avg_fps, hand_ok, mode)
+
+        cv2.imshow(WIN_NAME, ui)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('d') or key == ord('D'):
-            mode = MODE_DRAW if mode == MODE_MOUSE else MODE_MOUSE
-            smoother.reset()
-            prev_draw_pt = None
-            print(f"   Mode → {mode}")
-        elif key == ord('c') or key == ord('C'):
-            canvas[:] = 0
-            glitter.particles.clear()
-            print("   Canvas cleared.")
-        elif key == ord('q') or key == 27:
+
+        if key == ord('q') or key == 27:
             break
+        elif key in (ord('m'), ord('M')):
+            state["mode"] = "MOUSE"
+            smoother.reset()
+        elif key in (ord('d'), ord('D')):
+            state["mode"] = "DRAW"
+            prev_draw_x = prev_draw_y = 0
+        elif key in (ord('v'), ord('V')):
+            state["mode"] = "VOLUME"
+        elif key in (ord('c'), ord('C')):
+            if state["mode"] == "DRAW":
+                canvas[:] = 0
+                glitter.clear()
+                prev_draw_x = prev_draw_y = 0
 
     cap.release()
     cv2.destroyAllWindows()
-    print("   Bye! ✓")
+    print("[INFO] Air AI Controller closed.")
 
 
-# ─── entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main_v2()
+    main_with_ui()

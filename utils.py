@@ -1,266 +1,181 @@
 """
 utils.py
 --------
-Utility functions shared across the Air AI Controller.
-
-Why NumPy here?
-  - np.interp  → fast linear interpolation for coordinate remapping
-  - np.hypot   → vectorised Euclidean distance
-  - np.clip    → clean clamping without if/else chains
-  - ndarray ops → in-place pixel blending for glitter effect
-
-Why not OpenCV for maths?
-  OpenCV is great for image ops; NumPy is more ergonomic for scalar maths
-  like distance and smoothing — no unnecessary overhead.
+Utility functions: coordinate smoothing, interpolation, distance helpers,
+OpenCV drawing helpers, and glitter-effect generator.
 """
-
-import math
-import random
-import time
-from collections import deque
 
 import cv2
 import numpy as np
+import random
+import math
 
 
-# ─────────────────────────────────────────────
-#  Distance helpers
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Smoothing / Interpolation
+# ---------------------------------------------------------------------------
 
-def euclidean_distance(p1: tuple, p2: tuple) -> float:
-    """Straight-line pixel distance between two (x,y) points."""
+class SmoothCursor:
+    """
+    Exponential moving-average smoother for (x, y) coordinates.
+    Reduces jitter while keeping cursor responsive.
+    """
+
+    def __init__(self, alpha=0.25):
+        """
+        alpha: smoothing factor (0 = frozen, 1 = no smoothing).
+        Lower alpha → smoother but more lag. 0.20-0.30 is a good range.
+        """
+        self.alpha = alpha
+        self.sx = None
+        self.sy = None
+
+    def update(self, x, y):
+        """Feed a new raw coordinate and return the smoothed value."""
+        if self.sx is None:
+            self.sx, self.sy = float(x), float(y)
+        else:
+            self.sx = self.alpha * x + (1 - self.alpha) * self.sx
+            self.sy = self.alpha * y + (1 - self.alpha) * self.sy
+        return int(self.sx), int(self.sy)
+
+    def reset(self):
+        self.sx = self.sy = None
+
+
+def interpolate(value, in_min, in_max, out_min, out_max):
+    """
+    Map a value from one range to another (like Arduino's map()).
+    Clamps output to [out_min, out_max].
+    """
+    value   = max(in_min, min(in_max, value))
+    ratio   = (value - in_min) / (in_max - in_min + 1e-6)
+    result  = out_min + ratio * (out_max - out_min)
+    return float(np.clip(result, min(out_min, out_max), max(out_min, out_max)))
+
+
+# ---------------------------------------------------------------------------
+# Distance helpers
+# ---------------------------------------------------------------------------
+
+def euclidean(p1, p2):
+    """Return Euclidean distance between two (x, y) tuples."""
     return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
 
-def midpoint(p1: tuple, p2: tuple) -> tuple[int, int]:
-    """Integer midpoint between two (x,y) points."""
-    return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+# ---------------------------------------------------------------------------
+# OpenCV drawing helpers
+# ---------------------------------------------------------------------------
 
-
-# ─────────────────────────────────────────────
-#  Smoothing / jitter reduction
-# ─────────────────────────────────────────────
-
-class SmoothFilter:
+def draw_rounded_rect(img, x1, y1, x2, y2, radius, color, thickness=-1, alpha=1.0):
     """
-    Exponential moving average (EMA) smoother for x,y mouse coords.
-    
-    EMA formula:  smoothed = alpha * current + (1 - alpha) * previous
-    
-    Why EMA over a simple rolling average?
-      - EMA is O(1) memory and O(1) compute per frame.
-      - It reacts quickly to deliberate movement (alpha ~ 0.2–0.4 is a
-        good balance) while dampening high-frequency jitter.
-      - A rolling average introduces lag proportional to window size.
-    
-    Args:
-        alpha: Smoothing factor in (0, 1].
-               0 → never moves (infinite lag), 1 → no smoothing (raw).
-               Default 0.25 gives smooth cursor without noticeable lag.
+    Draw a filled or outlined rectangle with rounded corners on img.
+    Supports per-call transparency via alpha blend onto a copy.
     """
-
-    def __init__(self, alpha: float = 0.25):
-        self.alpha   = alpha
-        self.prev_x  = None
-        self.prev_y  = None
-
-    def smooth(self, x: float, y: float) -> tuple[float, float]:
-        if self.prev_x is None:
-            self.prev_x, self.prev_y = x, y
-        sx = self.alpha * x + (1 - self.alpha) * self.prev_x
-        sy = self.alpha * y + (1 - self.alpha) * self.prev_y
-        self.prev_x, self.prev_y = sx, sy
-        return sx, sy
-
-    def reset(self):
-        self.prev_x = self.prev_y = None
-
-
-# ─────────────────────────────────────────────
-#  Coordinate mapping
-# ─────────────────────────────────────────────
-
-def map_to_screen(px: float, py: float,
-                  cam_w: int, cam_h: int,
-                  screen_w: int, screen_h: int,
-                  margin: int = 100) -> tuple[int, int]:
-    """
-    Map a camera pixel (px, py) to a screen pixel (sx, sy).
-    
-    We shrink the active camera region by `margin` pixels on each side
-    so reaching screen edges is comfortable without moving to camera corners.
-    
-    np.interp does the linear interpolation:
-        output = out_min + (value - in_min) / (in_max - in_min) * (out_max - out_min)
-    then np.clip ensures we never go out of screen bounds.
-    """
-    sx = int(np.interp(px, [margin, cam_w - margin], [0, screen_w]))
-    sy = int(np.interp(py, [margin, cam_h - margin], [0, screen_h]))
-    sx = int(np.clip(sx, 0, screen_w - 1))
-    sy = int(np.clip(sy, 0, screen_h - 1))
-    return sx, sy
-
-
-# ─────────────────────────────────────────────
-#  Volume level mapping
-# ─────────────────────────────────────────────
-
-def distance_to_volume(dist: float,
-                        min_dist: float = 30,
-                        max_dist: float = 200) -> int:
-    """
-    Convert thumb-index distance (pixels) to a volume percentage [0, 100].
-    
-    np.interp handles the linear mapping; clip guards against finger
-    positions outside the expected range.
-    """
-    vol = int(np.interp(dist, [min_dist, max_dist], [0, 100]))
-    return int(np.clip(vol, 0, 100))
-
-
-# ─────────────────────────────────────────────
-#  Click debounce
-# ─────────────────────────────────────────────
-
-class ClickDebounce:
-    """
-    Prevents accidental rapid-fire clicks.
-    
-    A click is registered only if at least `cooldown` seconds have elapsed
-    since the last registered click. Simple time-based guard.
-    """
-
-    def __init__(self, cooldown: float = 0.4):
-        self.cooldown   = cooldown
-        self.last_click = 0.0
-
-    def can_click(self) -> bool:
-        now = time.time()
-        if now - self.last_click >= self.cooldown:
-            self.last_click = now
-            return True
-        return False
-
-
-# ─────────────────────────────────────────────
-#  Drawing canvas helpers
-# ─────────────────────────────────────────────
-
-def draw_rounded_rect(img: np.ndarray, pt1: tuple, pt2: tuple,
-                      color: tuple, thickness: int = -1,
-                      radius: int = 12) -> None:
-    """
-    Draw a rectangle with rounded corners on `img` (in-place).
-    
-    OpenCV has no native rounded-rect function, so we decompose it into
-    four arcs + three filled rectangles (or three stroked segments).
-    Used for UI panels so they feel modern rather than boxy.
-    """
-    x1, y1 = pt1
-    x2, y2 = pt2
-
-    if thickness == -1:  # filled
-        # Fill three rectangles to cover interior
-        cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
-        cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
-        # Four corner circles
-        for cx, cy in [(x1 + radius, y1 + radius),
-                       (x2 - radius, y1 + radius),
-                       (x1 + radius, y2 - radius),
-                       (x2 - radius, y2 - radius)]:
-            cv2.circle(img, (cx, cy), radius, color, -1)
+    overlay = img.copy()
+    # Four corner circles
+    cv2.circle(overlay, (x1 + radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y1 + radius), radius, color, thickness)
+    cv2.circle(overlay, (x1 + radius, y2 - radius), radius, color, thickness)
+    cv2.circle(overlay, (x2 - radius, y2 - radius), radius, color, thickness)
+    # Fill rectangles
+    cv2.rectangle(overlay, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
+    cv2.rectangle(overlay, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
+    if alpha < 1.0:
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
     else:
-        # Outline only
-        cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
-        cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
-        for cx, cy in [(x1 + radius, y1 + radius),
-                       (x2 - radius, y1 + radius),
-                       (x1 + radius, y2 - radius),
-                       (x2 - radius, y2 - radius)]:
-            cv2.ellipse(img, (cx, cy), (radius, radius), 0, 0, 0, color, thickness)
+        np.copyto(img, overlay)
 
 
-def overlay_alpha(bg: np.ndarray, overlay: np.ndarray,
-                  x: int, y: int, alpha: float = 0.6) -> None:
-    """
-    Blend `overlay` onto `bg` at position (x, y) with given alpha.
-    
-    Uses NumPy in-place ops for speed — avoids creating temporary arrays
-    by using cv2.addWeighted on the ROI slice only.
-    """
-    h, w = overlay.shape[:2]
-    roi = bg[y:y+h, x:x+w]
-    if roi.shape[:2] != (h, w):
-        return
-    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
+def put_text_shadow(img, text, pos, font, scale, color, thickness=1, shadow_color=(0, 0, 0)):
+    """Draw text with a subtle drop shadow for readability on any background."""
+    ox, oy = pos
+    cv2.putText(img, text, (ox + 1, oy + 1), font, scale, shadow_color, thickness + 1, cv2.LINE_AA)
+    cv2.putText(img, text, pos,              font, scale, color,        thickness,     cv2.LINE_AA)
 
 
-# ─────────────────────────────────────────────
-#  Glitter / sparkle effect
-# ─────────────────────────────────────────────
+def draw_gradient_rect(img, x1, y1, x2, y2, color_top, color_bottom):
+    """Fill a rectangle with a vertical gradient between two BGR colors."""
+    for row in range(y1, y2):
+        t = (row - y1) / max(y2 - y1 - 1, 1)
+        b = tuple(int(color_top[i] * (1 - t) + color_bottom[i] * t) for i in range(3))
+        cv2.line(img, (x1, row), (x2, row), b, 1)
+
+
+# ---------------------------------------------------------------------------
+# Glitter / sparkle effect
+# ---------------------------------------------------------------------------
 
 class GlitterEffect:
     """
-    Renders animated sparkle particles that follow the drawing cursor.
-    
-    Each frame we:
-      1. Spawn N new particles near the current tip position.
-      2. Age existing particles (reduce life, drift position randomly).
-      3. Draw each live particle as a small filled circle with fading opacity.
-    
-    Stored as a deque so old particles are automatically evicted — O(1) append/pop.
+    Maintains a pool of sparkle particles that decay over time.
+    Call `spawn(x, y)` each frame when drawing, then `render(canvas)` to paint.
     """
 
-    def __init__(self, max_particles: int = 120):
-        self.max_particles = max_particles
-        # Each particle: [x, y, radius, life (0–1), r, g, b]
-        self.particles: deque = deque(maxlen=max_particles)
+    def __init__(self, max_particles=120, lifespan=18):
+        self.particles   = []   # Each: [x, y, life, max_life, size, color]
+        self.max_p       = max_particles
+        self.lifespan    = lifespan
+        self.COLORS      = [
+            (255, 220, 80),   # Gold
+            (255, 255, 255),  # White
+            (80, 200, 255),   # Cyan-blue
+            (255, 120, 220),  # Pink
+            (150, 255, 150),  # Mint
+        ]
 
-    def emit(self, x: int, y: int, color: tuple, intensity: int = 1):
-        """Spawn `intensity` new sparkles near (x, y)."""
-        for _ in range(intensity):
-            jx = x + random.randint(-12, 12)
-            jy = y + random.randint(-12, 12)
-            r  = random.randint(2, 6)
-            # Random tint blended with base drawing color
-            rc = min(255, color[2] + random.randint(-40, 40))
-            gc = min(255, color[1] + random.randint(-40, 40))
-            bc = min(255, color[0] + random.randint(-40, 40))
-            self.particles.append([jx, jy, r, 1.0, rc, gc, bc])
+    def spawn(self, x, y):
+        """Spawn a burst of sparkles near (x, y)."""
+        count = random.randint(3, 7)
+        for _ in range(count):
+            if len(self.particles) >= self.max_p:
+                break
+            ox = x + random.randint(-12, 12)
+            oy = y + random.randint(-12, 12)
+            life  = random.randint(self.lifespan // 2, self.lifespan)
+            size  = random.randint(2, 5)
+            color = random.choice(self.COLORS)
+            self.particles.append([ox, oy, life, life, size, color])
 
-    def update_and_draw(self, frame: np.ndarray) -> None:
-        """Age particles and render them onto `frame`."""
+    def render(self, canvas):
+        """Draw all alive particles onto canvas and age them."""
         alive = []
         for p in self.particles:
-            p[3] -= 0.06        # age: reduce life
-            p[0] += random.randint(-2, 2)   # drift x
-            p[1] += random.randint(-2, 1)   # drift y (slight upward)
-            if p[3] > 0:
+            x, y, life, max_life, size, color = p
+            if life > 0:
+                alpha_ratio = life / max_life
+                # Fade color as particle ages
+                faded = tuple(int(c * alpha_ratio) for c in color)
+                cv2.circle(canvas, (x, y), size, faded, -1, cv2.LINE_AA)
+                p[2] -= 1
                 alive.append(p)
-                alpha_val = p[3]            # life doubles as alpha
-                rad  = max(1, int(p[2] * p[3]))
-                color = (int(p[6] * alpha_val),
-                         int(p[5] * alpha_val),
-                         int(p[4] * alpha_val))
-                cv2.circle(frame, (int(p[0]), int(p[1])), rad, color, -1)
+        self.particles = alive
 
-        # Replace deque content with only alive particles
-        self.particles.clear()
-        self.particles.extend(alive)
+    def clear(self):
+        self.particles = []
 
 
-# ─────────────────────────────────────────────
-#  FPS counter
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Click debouncer
+# ---------------------------------------------------------------------------
 
-class FPSCounter:
-    """Rolling FPS estimate over a short window."""
+class ClickDebounce:
+    """
+    Prevents accidental rapid-fire clicks by enforcing a minimum interval
+    between successive click events (frame-count based).
+    """
 
-    def __init__(self, window: int = 20):
-        self.times: deque = deque(maxlen=window)
+    def __init__(self, cooldown_frames=20):
+        self.cooldown = cooldown_frames
+        self.counter  = 0
 
-    def tick(self) -> float:
-        self.times.append(time.time())
-        if len(self.times) < 2:
-            return 0.0
-        return (len(self.times) - 1) / (self.times[-1] - self.times[0])
+    def ready(self):
+        """Return True if a click is allowed right now."""
+        if self.counter == 0:
+            return True
+        self.counter -= 1
+        return False
+
+    def trigger(self):
+        """Call after a successful click to start the cooldown."""
+        self.counter = self.cooldown
