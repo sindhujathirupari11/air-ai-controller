@@ -131,7 +131,8 @@ python app.py
 ## 👩‍💻 Developed by
 
 Sindhuja Thirupari  
-2nd Year B.Tech | Computer Science & Engineering  
+2nd Year B.Tech | Computer Science & Engineering 
+Interested in AI  and Product Development 
 
 ---
 
@@ -139,4 +140,4 @@ Sindhuja Thirupari
 
 If you found this project useful:
 - Star the repository  
-- Fork and improve it  
+- Fork and improve it
